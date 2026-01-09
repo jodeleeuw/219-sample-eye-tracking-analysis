@@ -1,0 +1,128 @@
+This is the OSF repo: https://osf.io/fes78/overview
+
+```{r include=FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(osfr)
+library(jsonlite)
+```
+
+```{r include=FALSE}
+osf_retrieve_node("fes78") |>
+  osf_ls_files(pattern=".json", n_max=Inf) |>
+  osf_download()
+```
+
+```{r include=FALSE}
+data <- list.files(pattern=".json") |>
+  lapply(fromJSON) |>
+  bind_rows()
+```
+
+```{r include=FALSE}
+visual_search_data <- data |>
+  filter(task=="visual_search", is_practice == FALSE) |>
+  select(subject, trial_index, set_size, search_type, target_present, rt, correct, tobii_data, item_positions)
+```
+
+```{r include=FALSE}
+visual_search_summary_data <- visual_search_data |>
+  group_by(subject, set_size, search_type, target_present) |>
+  summarize(M=mean(rt))
+```
+
+```{r echo=FALSE}
+ggplot(visual_search_summary_data, aes(color=target_present, x=set_size, y=M)) +
+  facet_wrap("search_type") +
+  geom_point() +
+  geom_smooth(method="lm")
+```
+
+
+```{r include=FALSE}
+eye_tracking_data <- visual_search_data |>
+  #unnest_wider(item_positions, names_sep="_") |>
+  unnest(tobii_data) |>
+  select(-leftPupilDiameter, -rightPupilDiameter)
+```
+
+```{r echo=FALSE}
+ggplot(eye_tracking_data, aes(x=x, y=y, color=search_type)) +
+  geom_point() +
+  facet_wrap("trial_index") + 
+  theme_void()
+```
+
+
+Saccade detection
+
+```{r include=FALSE}
+compute_fixations <- function(data) {
+
+  sampling_interval <- median(diff(data$timestamp))
+
+  d <- data |>
+    mutate(vx = (lead(x, 2) + lead(x, 1) - lag(x, 1) - lag(x, 2))/(6*sampling_interval)) |>
+    mutate(vy = (lead(y, 2) + lead(y, 1) - lag(y, 1) - lag(y, 2))/(6*sampling_interval)) |>
+    filter(!is.na(vx), !is.na(vy))
+
+  sigma_x <- sqrt(median(d$vx^2) - median(d$vx)^2)
+  sigma_y <- sqrt(median(d$vy^2) - median(d$vy)^2)
+
+  lambda <- 6
+
+  thresh_x <- lambda * sigma_x
+  thresh_y <- lambda * sigma_y
+
+  d <- d |>
+    mutate(is_saccade = (vx / thresh_x)^2 + (vy / thresh_y)^2 > 1) |>
+    mutate(event = cumsum(is_saccade != lag(is_saccade, default=first(is_saccade))))
+
+  fixations <- d |>
+    group_by(event) |>
+    summarize(
+      is_saccade = first(is_saccade),
+      x = median(x),
+      y = median(y),
+      start = first(timestamp),
+      end = last(timestamp),
+      duration = last(timestamp) - first(timestamp),
+      n_samples = n()
+    ) %>%
+    filter(!is_saccade)
+
+  return(fixations)
+}
+
+```
+
+
+```{r}
+
+one_trial <- eye_tracking_data |>
+  filter(subject=="3t1hlagk9xf9", trial_index==86)
+
+stimuli <- (one_trial |> slice_head(n=1) |> select(item_positions))[[1]][[1]]
+
+fixations <- compute_fixations(one_trial)
+
+ggplot(stimuli, aes(x=x, y=y, color=color, shape=shape)) +
+  geom_point(size=5) +
+  geom_point(data=one_trial, mapping=aes(x=x*1920, y=y*1080), size=1, shape="circle", color="grey50") +
+  geom_point(data=fixations, mapping=aes(x=x*1920, y=y*1080, color=NULL, shape=NULL), size=10, shape="circle open", color="black") +
+  geom_path(data=fixations, mapping=aes(x=x*1920, y=y*1080, color=NULL, shape=NULL), arrow=arrow())+
+  coord_cartesian(xlim=c(0,1920), ylim=c(0, 1080)) +
+  scale_y_reverse() + 
+  scale_color_manual(values=c("#0D47A1", "#E53935"), guide=FALSE)+
+  scale_shape_manual(values=c("circle open", "cross"), guide=FALSE)+
+  theme_void()+
+  theme(panel.border = element_rect(color="black", linewidth=1))
+
+```
+
+
+# Notes on things to fix in the data
+
+1. there's no pixel-level eye tracking. it is in normalized coords.
+2. three timestamps feels excessive. figure out which one should be included.
