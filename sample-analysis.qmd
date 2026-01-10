@@ -6,6 +6,7 @@ library(tidyr)
 library(ggplot2)
 library(osfr)
 library(jsonlite)
+library(purrr)
 ```
 
 ```{r include=FALSE}
@@ -44,15 +45,10 @@ ggplot(visual_search_summary_data, aes(color=target_present, x=set_size, y=M)) +
 eye_tracking_data <- visual_search_data |>
   #unnest_wider(item_positions, names_sep="_") |>
   unnest(tobii_data) |>
-  select(-leftPupilDiameter, -rightPupilDiameter)
+  select(-leftPupilDiameter, -rightPupilDiameter) |>
+  mutate(x=1920*x, y=1080*y)
 ```
 
-```{r echo=FALSE}
-ggplot(eye_tracking_data, aes(x=x, y=y, color=search_type)) +
-  geom_point() +
-  facet_wrap("trial_index") + 
-  theme_void()
-```
 
 
 Saccade detection
@@ -94,9 +90,16 @@ compute_fixations <- function(data) {
 
   return(fixations)
 }
-
 ```
 
+# Extract data frame of item positions
+```{r}
+item_locations <- eye_tracking_data|>
+  select(subject, trial_index, search_type, set_size, target_present, item_positions) |>
+  group_by(subject, trial_index, search_type, set_size, target_present) |>
+  slice_head(n=1) |>
+  unnest(item_positions)
+```
 
 ```{r}
 
@@ -107,11 +110,11 @@ stimuli <- (one_trial |> slice_head(n=1) |> select(item_positions))[[1]][[1]]
 
 fixations <- compute_fixations(one_trial)
 
-ggplot(stimuli, aes(x=x, y=y, color=color, shape=shape)) +
-  geom_point(size=5) +
-  geom_point(data=one_trial, mapping=aes(x=x*1920, y=y*1080), size=1, shape="circle", color="grey50") +
-  geom_point(data=fixations, mapping=aes(x=x*1920, y=y*1080, color=NULL, shape=NULL), size=10, shape="circle open", color="black") +
-  geom_path(data=fixations, mapping=aes(x=x*1920, y=y*1080, color=NULL, shape=NULL), arrow=arrow())+
+ggplot(stimuli, aes(x=x, y=y)) +
+  geom_point(size=5, mapping=aes(color=color, shape=shape)) +
+  geom_point(data=one_trial, size=1, shape="circle", color="grey50") +
+  geom_point(data=fixations, size=10, shape="circle open", color="black") +
+  geom_path(data=fixations, color="black", arrow=arrow())+
   coord_cartesian(xlim=c(0,1920), ylim=c(0, 1080)) +
   scale_y_reverse() + 
   scale_color_manual(values=c("#0D47A1", "#E53935"), guide=FALSE)+
@@ -120,6 +123,111 @@ ggplot(stimuli, aes(x=x, y=y, color=color, shape=shape)) +
   theme(panel.border = element_rect(color="black", linewidth=1))
 
 ```
+
+# Extract fixations per trial
+
+```{r include=FALSE}
+fixations <- eye_tracking_data |>
+  group_by(subject, trial_index, search_type, set_size, target_present) |>
+  reframe(compute_fixations(pick(everything())))
+```
+
+
+# Count fixations for each trial
+
+```{r}
+fixation_counts <- fixations |>
+  group_by(subject, trial_index, search_type, set_size, target_present) |>
+  summarize(n_fixations = n())
+```
+
+```{r echo=FALSE}
+ggplot(fixation_counts, aes(x=set_size, y=n_fixations, color=search_type)) +
+  geom_point() +
+  facet_wrap("target_present") +
+  geom_smooth(method="lm")
+```
+
+# FVF estimates
+
+Algorithm is:
+1. create radius around each fixation point in target present trials.
+2. expand radius until it contains 50% of all items on the screen.
+3. that is FVF for that trial
+
+
+```{r include=FALSE}
+calculate_coverage <- function(fixations_trial, items_trial, radius) {
+
+  # For each distractor, check if ANY fixation is within radius
+  # Cross join: every distractor × every fixation
+  visited <- crossing(
+    items_trial %>% select(item_x = x, item_y = y),
+    fixations_trial %>% select(fix_x = x, fix_y = y)
+  ) %>%
+    mutate(distance = sqrt((item_x - fix_x)^2 + (item_y - fix_y)^2)) %>%
+    group_by(item_x, item_y) %>%
+    summarise(visited = any(distance <= radius), .groups = "drop")
+  
+  mean(visited$visited)
+}
+
+find_fvf <- function(fixations_trial, items_trial, 
+                     radii = seq(10, 400, by = 5)) {
+  
+  coverages <- sapply(radii, function(r) {
+    calculate_coverage(fixations_trial, items_trial, r)
+  })
+  
+  # Find first radius where coverage >= 0.5
+  threshold_idx <- which(coverages >= 0.5)[1]
+  
+  if (is.na(threshold_idx)) {
+    return(list(fvf = NA, radii = radii, coverages = coverages))
+  }
+  
+  list(
+    fvf = radii[threshold_idx],
+    radii = radii,
+    coverages = coverages
+  )
+}
+
+```
+
+
+```{r include=FALSE}
+nested_items <- item_locations |>
+  group_by(subject, trial_index, search_type, set_size, target_present) |>
+  nest() |>
+  rename(item_locations = data)
+
+nested_fixations <- fixations |>
+  group_by(subject, trial_index, search_type, set_size, target_present) |>
+  nest() |>
+  rename(fixations = data)
+
+fvf_data <- nested_items |>
+  left_join(nested_fixations, by=c("subject", "trial_index", "search_type", "set_size", "target_present"))
+```
+
+```{r include=FALSE}
+fvf_result <- fvf_data |>
+  filter(target_present == FALSE) |>
+  mutate(fvf = map2(fixations, item_locations, find_fvf)) %>%
+  unnest_wider(fvf) |>
+  select(-radii, -coverages, -item_locations, -fixations)
+```
+
+```{r echo=FALSE}
+ggplot(fvf_result, aes(x=set_size, y=fvf, color=search_type))+
+  facet_wrap("search_type")+
+  geom_point()+
+  geom_smooth(method="loess")
+```
+
+
+
 
 
 # Notes on things to fix in the data
